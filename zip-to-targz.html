@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ZIP → TAR.GZ Converter</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #1a1a2e;
+            min-height: 100vh;
+            margin: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .container {
+            text-align: center;
+            max-width: 500px;
+            width: 100%;
+        }
+        h1 {
+            color: #eee;
+            font-weight: 400;
+            margin-bottom: 30px;
+            font-size: 1.5rem;
+        }
+        .droplet {
+            width: 200px;
+            height: 200px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-radius: 50% 50% 50% 50% / 60% 60% 40% 40%;
+            margin: 0 auto 30px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 10px 40px rgba(102, 126, 234, 0.4);
+            position: relative;
+            overflow: hidden;
+        }
+        .droplet:hover {
+            transform: scale(1.05);
+            box-shadow: 0 15px 50px rgba(102, 126, 234, 0.5);
+        }
+        .droplet.dragover {
+            transform: scale(1.1);
+            background: linear-gradient(135deg, #764ba2 0%, #667eea 100%);
+            box-shadow: 0 20px 60px rgba(118, 75, 162, 0.6);
+        }
+        .droplet.processing {
+            animation: pulse 1s ease-in-out infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.05); }
+        }
+        .droplet-text {
+            color: white;
+            font-size: 0.9rem;
+            padding: 20px;
+            text-align: center;
+            line-height: 1.4;
+            z-index: 1;
+        }
+        .droplet-text .icon {
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+            display: block;
+        }
+        input[type="file"] {
+            display: none;
+        }
+        .status {
+            color: #aaa;
+            font-size: 0.85rem;
+            min-height: 24px;
+        }
+        .status.success {
+            color: #4ade80;
+        }
+        .status.error {
+            color: #f87171;
+        }
+        .hint {
+            color: #666;
+            font-size: 0.75rem;
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>ZIP → TAR.GZ</h1>
+        <div class="droplet" id="droplet">
+            <div class="droplet-text">
+                <span class="icon">📦</span>
+                Drop .zip here
+            </div>
+        </div>
+        <div class="status" id="status"></div>
+        <input type="file" id="fileInput" accept=".zip">
+        <p class="hint">Click or drag & drop a .zip file</p>
+    </div>
+
+    <script>
+        const droplet = document.getElementById('droplet');
+        const fileInput = document.getElementById('fileInput');
+        const status = document.getElementById('status');
+
+        // Tar creation utilities
+        function createTarHeader(name, size, isDir) {
+            const header = new Uint8Array(512);
+            const encoder = new TextEncoder();
+            
+            // File name (100 bytes)
+            const nameBytes = encoder.encode(name.slice(0, 99));
+            header.set(nameBytes, 0);
+            
+            // File mode (8 bytes) - octal
+            const mode = isDir ? '0000755' : '0000644';
+            header.set(encoder.encode(mode + ' '), 100);
+            
+            // UID (8 bytes)
+            header.set(encoder.encode('0000000 '), 108);
+            
+            // GID (8 bytes)
+            header.set(encoder.encode('0000000 '), 116);
+            
+            // Size (12 bytes) - octal
+            const sizeOctal = size.toString(8).padStart(11, '0');
+            header.set(encoder.encode(sizeOctal + ' '), 124);
+            
+            // Mtime (12 bytes) - octal
+            const mtime = Math.floor(Date.now() / 1000).toString(8).padStart(11, '0');
+            header.set(encoder.encode(mtime + ' '), 136);
+            
+            // Checksum placeholder (8 bytes of spaces)
+            header.set(encoder.encode('        '), 148);
+            
+            // Type flag
+            header[156] = isDir ? 53 : 48; // '5' for dir, '0' for file
+            
+            // Link name (100 bytes) - empty
+            
+            // USTAR indicator
+            header.set(encoder.encode('ustar'), 257);
+            header[262] = 0;
+            header.set(encoder.encode('00'), 263);
+            
+            // Owner name
+            header.set(encoder.encode('user'), 265);
+            
+            // Group name
+            header.set(encoder.encode('user'), 297);
+            
+            // Calculate checksum
+            let checksum = 0;
+            for (let i = 0; i < 512; i++) {
+                checksum += header[i];
+            }
+            const checksumOctal = checksum.toString(8).padStart(6, '0') + '\0 ';
+            header.set(encoder.encode(checksumOctal), 148);
+            
+            return header;
+        }
+
+        function padTo512(data) {
+            const remainder = data.length % 512;
+            if (remainder === 0) return data;
+            const padding = 512 - remainder;
+            const padded = new Uint8Array(data.length + padding);
+            padded.set(data);
+            return padded;
+        }
+
+        async function zipToTarGz(zipFile) {
+            const zip = await JSZip.loadAsync(zipFile);
+            const tarParts = [];
+            
+            // Collect all entries
+            const entries = [];
+            zip.forEach((relativePath, zipEntry) => {
+                entries.push({ path: relativePath, entry: zipEntry });
+            });
+            
+            // Sort to ensure directories come before their contents
+            entries.sort((a, b) => a.path.localeCompare(b.path));
+            
+            for (const { path, entry } of entries) {
+                if (entry.dir) {
+                    // Directory entry
+                    const header = createTarHeader(path, 0, true);
+                    tarParts.push(header);
+                } else {
+                    // File entry
+                    const content = await entry.async('uint8array');
+                    const header = createTarHeader(path, content.length, false);
+                    tarParts.push(header);
+                    tarParts.push(padTo512(content));
+                }
+            }
+            
+            // Add two empty 512-byte blocks at end
+            tarParts.push(new Uint8Array(1024));
+            
+            // Combine all parts
+            const totalLength = tarParts.reduce((sum, part) => sum + part.length, 0);
+            const tar = new Uint8Array(totalLength);
+            let offset = 0;
+            for (const part of tarParts) {
+                tar.set(part, offset);
+                offset += part.length;
+            }
+            
+            // Gzip compress
+            const gzipped = pako.gzip(tar);
+            
+            return gzipped;
+        }
+
+        function setStatus(message, type = '') {
+            status.textContent = message;
+            status.className = 'status ' + type;
+        }
+
+        async function processFile(file) {
+            if (!file.name.toLowerCase().endsWith('.zip')) {
+                setStatus('Please drop a .zip file', 'error');
+                return;
+            }
+            
+            droplet.classList.add('processing');
+            setStatus('Converting...');
+            
+            try {
+                const tarGz = await zipToTarGz(file);
+                
+                // Create download
+                const blob = new Blob([tarGz], { type: 'application/gzip' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                const newName = file.name.replace(/\.zip$/i, '.tar.gz');
+                a.href = url;
+                a.download = newName;
+                a.click();
+                URL.revokeObjectURL(url);
+                
+                setStatus(`✓ Downloaded ${newName}`, 'success');
+            } catch (err) {
+                console.error(err);
+                setStatus('Error: ' + err.message, 'error');
+            } finally {
+                droplet.classList.remove('processing');
+            }
+        }
+
+        // Event handlers
+        droplet.addEventListener('click', () => fileInput.click());
+        
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files[0]) {
+                processFile(e.target.files[0]);
+            }
+        });
+
+        droplet.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            droplet.classList.add('dragover');
+        });
+
+        droplet.addEventListener('dragleave', () => {
+            droplet.classList.remove('dragover');
+        });
+
+        droplet.addEventListener('drop', (e) => {
+            e.preventDefault();
+            droplet.classList.remove('dragover');
+            if (e.dataTransfer.files[0]) {
+                processFile(e.dataTransfer.files[0]);
+            }
+        });
+    </script>
+</body>
+</html>
