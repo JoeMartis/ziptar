@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ZIP → TAR.GZ Converter</title>
+    <title>TAR.GZ Converter</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
     <style>
@@ -98,21 +98,23 @@
 </head>
 <body>
     <div class="container">
-        <h1>ZIP → TAR.GZ</h1>
+        <h1>TAR.GZ Converter</h1>
         <div class="droplet" id="droplet">
             <div class="droplet-text">
                 <span class="icon">📦</span>
-                Drop .zip here
+                Drop folder or .zip
             </div>
         </div>
         <div class="status" id="status"></div>
         <input type="file" id="fileInput" accept=".zip">
-        <p class="hint">Click or drag & drop a .zip file</p>
+        <input type="file" id="folderInput" webkitdirectory>
+        <p class="hint">Click or drag & drop a folder or .zip file</p>
     </div>
 
     <script>
         const droplet = document.getElementById('droplet');
         const fileInput = document.getElementById('fileInput');
+        const folderInput = document.getElementById('folderInput');
         const status = document.getElementById('status');
 
         // Constants
@@ -223,40 +225,35 @@
             return padded;
         }
 
-        async function zipToTarGz(zipFile) {
-            const zip = await JSZip.loadAsync(zipFile);
+        // Convert entries array [{path, content, isDir}] to tar.gz
+        async function entriesToTarGz(entries) {
             const tarParts = [];
             const warnings = [];
-
-            // Collect all entries
-            const entries = [];
-            zip.forEach((relativePath, zipEntry) => {
-                entries.push({ path: relativePath, entry: zipEntry });
-            });
 
             // Sort to ensure directories come before their contents
             entries.sort((a, b) => a.path.localeCompare(b.path));
 
-            for (const { path, entry } of entries) {
+            for (const entry of entries) {
                 // Check for non-ASCII characters in path
-                if (hasNonAscii(path)) {
-                    warnings.push(`Non-ASCII characters in path: ${path}`);
+                if (hasNonAscii(entry.path)) {
+                    warnings.push(`Non-ASCII characters in path: ${entry.path}`);
                 }
 
-                if (entry.dir) {
+                if (entry.isDir) {
                     // Directory entry
-                    const header = createTarHeader(path, 0, true);
+                    const dirPath = entry.path.endsWith('/') ? entry.path : entry.path + '/';
+                    const header = createTarHeader(dirPath, 0, true);
                     tarParts.push(header);
                 } else {
                     // File entry
-                    const content = await entry.async('uint8array');
+                    const content = entry.content;
 
                     // Validate file size
                     if (content.length > MAX_TAR_FILE_SIZE) {
-                        throw new Error(`File too large for TAR format (max ~8GB): ${path}`);
+                        throw new Error(`File too large for TAR format (max ~8GB): ${entry.path}`);
                     }
 
-                    const header = createTarHeader(path, content.length, false);
+                    const header = createTarHeader(entry.path, content.length, false);
                     tarParts.push(header);
                     // Only add content block if file is not empty
                     if (content.length > 0) {
@@ -267,7 +264,7 @@
 
             // Log warnings to console
             if (warnings.length > 0) {
-                console.warn('ZIP to TAR.GZ conversion warnings:');
+                console.warn('TAR.GZ conversion warnings:');
                 warnings.forEach(w => console.warn('  - ' + w));
             }
 
@@ -289,22 +286,127 @@
             return { data: gzipped, warnings: warnings };
         }
 
+        // Read entries from a ZIP file
+        async function readZipEntries(zipFile) {
+            const zip = await JSZip.loadAsync(zipFile);
+            const entries = [];
+
+            const zipEntries = [];
+            zip.forEach((relativePath, zipEntry) => {
+                zipEntries.push({ path: relativePath, entry: zipEntry });
+            });
+
+            for (const { path, entry } of zipEntries) {
+                if (entry.dir) {
+                    entries.push({ path: path, isDir: true });
+                } else {
+                    const content = await entry.async('uint8array');
+                    entries.push({ path: path, content: content, isDir: false });
+                }
+            }
+
+            return entries;
+        }
+
+        // Read a file as Uint8Array
+        function readFileAsArrayBuffer(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(new Uint8Array(reader.result));
+                reader.onerror = reject;
+                reader.readAsArrayBuffer(file);
+            });
+        }
+
+        // Recursively read a directory entry from DataTransfer
+        async function readDirectoryEntry(entry, basePath = '') {
+            const entries = [];
+
+            if (entry.isFile) {
+                const file = await new Promise((resolve, reject) => {
+                    entry.file(resolve, reject);
+                });
+                const content = await readFileAsArrayBuffer(file);
+                entries.push({
+                    path: basePath + entry.name,
+                    content: content,
+                    isDir: false
+                });
+            } else if (entry.isDirectory) {
+                const dirPath = basePath + entry.name + '/';
+                entries.push({ path: dirPath, isDir: true });
+
+                const reader = entry.createReader();
+                let batch;
+                do {
+                    batch = await new Promise((resolve, reject) => {
+                        reader.readEntries(resolve, reject);
+                    });
+                    for (const childEntry of batch) {
+                        const childEntries = await readDirectoryEntry(childEntry, dirPath);
+                        entries.push(...childEntries);
+                    }
+                } while (batch.length > 0);
+            }
+
+            return entries;
+        }
+
+        // Read entries from dropped folder using webkitGetAsEntry
+        async function readDroppedFolder(dataTransferItems) {
+            const entries = [];
+
+            for (const item of dataTransferItems) {
+                const entry = item.webkitGetAsEntry();
+                if (entry) {
+                    const itemEntries = await readDirectoryEntry(entry);
+                    entries.push(...itemEntries);
+                }
+            }
+
+            return entries;
+        }
+
+        // Read entries from file input with webkitdirectory
+        async function readFolderInput(files) {
+            const entries = [];
+            const dirs = new Set();
+
+            for (const file of files) {
+                // webkitRelativePath includes the folder name
+                const path = file.webkitRelativePath;
+
+                // Track directories
+                const parts = path.split('/');
+                let dirPath = '';
+                for (let i = 0; i < parts.length - 1; i++) {
+                    dirPath += parts[i] + '/';
+                    if (!dirs.has(dirPath)) {
+                        dirs.add(dirPath);
+                        entries.push({ path: dirPath, isDir: true });
+                    }
+                }
+
+                // Add file
+                const content = await readFileAsArrayBuffer(file);
+                entries.push({ path: path, content: content, isDir: false });
+            }
+
+            return entries;
+        }
+
         function setStatus(message, type = '') {
             status.textContent = message;
             status.className = 'status ' + type;
         }
 
-        async function processFile(file) {
-            if (!file.name.toLowerCase().endsWith('.zip')) {
-                setStatus('Please drop a .zip file', 'error');
-                return;
-            }
-            
+        async function processZipFile(file) {
             droplet.classList.add('processing');
-            setStatus('Converting...');
-            
+            setStatus('Converting ZIP...');
+
             try {
-                const result = await zipToTarGz(file);
+                const entries = await readZipEntries(file);
+                const result = await entriesToTarGz(entries);
 
                 // Create download
                 const blob = new Blob([result.data], { type: 'application/gzip' });
@@ -314,10 +416,38 @@
                 a.href = url;
                 a.download = newName;
                 a.click();
-                // Delay URL revocation to ensure download starts
                 setTimeout(() => URL.revokeObjectURL(url), 60000);
 
-                // Show status with warning count if any
+                if (result.warnings.length > 0) {
+                    setStatus(`✓ Downloaded ${newName} (${result.warnings.length} warning(s) - see console)`, 'success');
+                } else {
+                    setStatus(`✓ Downloaded ${newName}`, 'success');
+                }
+            } catch (err) {
+                console.error(err);
+                setStatus('Error: ' + err.message, 'error');
+            } finally {
+                droplet.classList.remove('processing');
+            }
+        }
+
+        async function processFolder(entries, folderName) {
+            droplet.classList.add('processing');
+            setStatus('Converting folder...');
+
+            try {
+                const result = await entriesToTarGz(entries);
+
+                // Create download
+                const blob = new Blob([result.data], { type: 'application/gzip' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                const newName = folderName + '.tar.gz';
+                a.href = url;
+                a.download = newName;
+                a.click();
+                setTimeout(() => URL.revokeObjectURL(url), 60000);
+
                 if (result.warnings.length > 0) {
                     setStatus(`✓ Downloaded ${newName} (${result.warnings.length} warning(s) - see console)`, 'success');
                 } else {
@@ -332,12 +462,42 @@
         }
 
         // Event handlers
-        droplet.addEventListener('click', () => fileInput.click());
-        
+        let clickMode = 'zip'; // Toggle between 'zip' and 'folder'
+
+        droplet.addEventListener('click', () => {
+            // Show a simple choice: alternate between zip and folder
+            if (clickMode === 'zip') {
+                fileInput.click();
+                clickMode = 'folder';
+            } else {
+                folderInput.click();
+                clickMode = 'zip';
+            }
+        });
+
         fileInput.addEventListener('change', (e) => {
             if (e.target.files[0]) {
-                processFile(e.target.files[0]);
+                const file = e.target.files[0];
+                if (file.name.toLowerCase().endsWith('.zip')) {
+                    processZipFile(file);
+                } else {
+                    setStatus('Please select a .zip file', 'error');
+                }
             }
+            e.target.value = ''; // Reset for next selection
+        });
+
+        folderInput.addEventListener('change', async (e) => {
+            if (e.target.files.length > 0) {
+                const files = e.target.files;
+                // Get folder name from first file's path
+                const firstPath = files[0].webkitRelativePath;
+                const folderName = firstPath.split('/')[0];
+
+                const entries = await readFolderInput(files);
+                processFolder(entries, folderName);
+            }
+            e.target.value = ''; // Reset for next selection
         });
 
         droplet.addEventListener('dragover', (e) => {
@@ -349,11 +509,38 @@
             droplet.classList.remove('dragover');
         });
 
-        droplet.addEventListener('drop', (e) => {
+        droplet.addEventListener('drop', async (e) => {
             e.preventDefault();
             droplet.classList.remove('dragover');
-            if (e.dataTransfer.files[0]) {
-                processFile(e.dataTransfer.files[0]);
+
+            const items = e.dataTransfer.items;
+            if (!items || items.length === 0) return;
+
+            // Check if it's a directory or a file
+            const firstItem = items[0];
+            const entry = firstItem.webkitGetAsEntry();
+
+            if (entry && entry.isDirectory) {
+                // It's a folder
+                droplet.classList.add('processing');
+                setStatus('Reading folder...');
+                try {
+                    const entries = await readDroppedFolder(items);
+                    const folderName = entry.name;
+                    await processFolder(entries, folderName);
+                } catch (err) {
+                    console.error(err);
+                    setStatus('Error reading folder: ' + err.message, 'error');
+                    droplet.classList.remove('processing');
+                }
+            } else if (e.dataTransfer.files[0]) {
+                // It's a file
+                const file = e.dataTransfer.files[0];
+                if (file.name.toLowerCase().endsWith('.zip')) {
+                    processZipFile(file);
+                } else {
+                    setStatus('Please drop a .zip file or a folder', 'error');
+                }
             }
         });
     </script>
